@@ -1672,13 +1672,25 @@ impl proto::Peer for Peer {
         // header
         if let Some(authority) = pseudo.authority {
             let maybe_authority = uri::Authority::from_maybe_shared(authority.clone().into_inner());
-            parts.authority = Some(maybe_authority.or_else(|why| {
-                malformed!(
+            parts.authority = Some(match maybe_authority {
+                Ok(authority) => authority,
+                // grpc-go sends a Unix socket path here, which `http` rejects.
+                // Substitute a valid authority instead of failing the request:
+                // gRPC dispatches on `:path`.
+                Err(why) if is_unix_socket_authority(&authority) => {
+                    tracing::debug!(
+                        "unix socket authority ({:?}): {}; using localhost",
+                        authority,
+                        why,
+                    );
+                    uri::Authority::from_static("localhost")
+                }
+                Err(why) => malformed!(
                     "malformed headers: malformed authority ({:?}): {}",
                     authority,
                     why,
-                )
-            })?);
+                ),
+            });
         }
 
         // A :scheme is required, except CONNECT.
@@ -1741,6 +1753,23 @@ impl proto::Peer for Peer {
     }
 }
 
+/// Does this `:authority` hold a Unix socket path instead of a host?
+///
+/// grpc-go dialing a `unix:` target puts the socket path in `:authority`,
+/// usually percent-encoded (`%2Fvar%2Frun%2Ffoo.sock`). The `http` crate
+/// rejects both the `%` and the `/`, so the value never parses as an
+/// authority.
+fn is_unix_socket_authority(authority: &str) -> bool {
+    if authority.starts_with("unix:") || authority.starts_with("unix-abstract:") {
+        return true;
+    }
+
+    // A plain or percent-encoded absolute path.
+    ["/", "%2F", "%2f"]
+        .iter()
+        .any(|prefix| authority.starts_with(prefix))
+}
+
 // ===== impl Handshaking =====
 
 impl<T, B> fmt::Debug for Handshaking<T, B>
@@ -1754,5 +1783,33 @@ where
             Handshaking::ReadingPreface(_) => f.write_str("ReadingPreface(_)"),
             Handshaking::Done => f.write_str("Done"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_unix_socket_authority;
+
+    #[test]
+    fn unix_socket_authorities() {
+        assert!(is_unix_socket_authority(
+            "%2Fvar%2Flib%2Fkubelet%2Fplugins%2Fdra.sock"
+        ));
+        assert!(is_unix_socket_authority(
+            "%2fvar%2flib%2fkubelet%2fplugins%2fdra.sock"
+        ));
+        assert!(is_unix_socket_authority("/var/run/foo.sock"));
+        assert!(is_unix_socket_authority("unix:/var/run/foo.sock"));
+        assert!(is_unix_socket_authority("unix:///var/run/foo.sock"));
+        assert!(is_unix_socket_authority("unix-abstract:foo.sock"));
+    }
+
+    #[test]
+    fn other_malformed_authorities() {
+        assert!(!is_unix_socket_authority(""));
+        assert!(!is_unix_socket_authority("exa mple.com"));
+        assert!(!is_unix_socket_authority("example.com%2Fpath"));
+        assert!(!is_unix_socket_authority("[::1"));
+        assert!(!is_unix_socket_authority("exam\u{00ad}ple.com"));
     }
 }
